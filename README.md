@@ -19,13 +19,13 @@ terraform apply
 ```
 * Create a virtual environment to run the Python scripts.
 ```bash
+cd ../..
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install boto3 jinja2
 ```
 * Render the vars input file.
 ```bash
-cd ../..
 python3 scripts/render_vars.py --tag-key Application --tag-value cw-dash --template dashboards.vars.jinja --rendered-file examples/complete/dashboards.vars.json
 ```
 * Render the Terraform template.
