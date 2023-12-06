@@ -1,0 +1,115 @@
+#!/bin/bash
+#shellcheck disable=SC2154,SC2086
+
+if [[ ${enable_log} == "true" ]]; then
+  exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+  set -x
+fi
+
+DATETIME_START=$(date -u '+%Y_%m_%d_T%H:%M:%SZ')
+echo "Script running at $DATETIME"
+
+HOME_DIR="/home/ec2-user"
+
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 3600")
+PARTITION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/services/partition)
+REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+PROXY_URL=${proxy_url}
+if [[ -n "$PROXY_URL" ]]; then
+  # https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-proxy.html
+  export HTTPS_PROXY="$PROXY_URL" # enables calls to service APIs
+
+  MAC=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac/)
+  VPC_CIDR=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/vpc-ipv4-cidr-blocks" | xargs | tr ' ' ',')
+
+  NO_PROXY_LIST=$VPC_CIDR,localhost,127.0.0.1,169.254.169.254,.internal,${no_proxy_list}
+  NO_PROXY_LIST=$(sed "s/,$//" <<< "$NO_PROXY_LIST")
+
+  # Set proxy for future processes
+  cloud-init-per instance env_proxy_config cat <<EOF >> /etc/environment
+http_proxy="$PROXY_URL"
+https_proxy="$PROXY_URL"
+no_proxy="$NO_PROXY_LIST"
+HTTP_PROXY="$PROXY_URL"
+HTTPS_PROXY="$PROXY_URL"
+NO_PROXY="$NO_PROXY_LIST"
+AWS_DEFAULT_REGION="$REGION"
+EOF
+
+  # https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-proxy-with-ssm-agent.html#ssm-agent-proxy-systemd
+  mkdir /etc/systemd/system/amazon-ssm-agent.service.d
+  cat <<EOF >> /etc/systemd/system/amazon-ssm-agent.service.d/override.conf
+[Service]
+EnvironmentFile=/etc/environment
+EOF
+
+fi
+
+# update; https://aws.amazon.com/premiumsupport/knowledge-center/ec2-troubleshoot-yum-errors-al1-al2/
+yum update -y
+yum install fio
+yum install -y amazon-efs-utils jq
+AWS_CA_BUNDLE="/etc/pki/tls/certs/ca-bundle.crt"
+
+  # Set path
+  cat << EOF > /etc/profile.d/set-path.sh
+export PATH=$PATH:/usr/local/bin
+EOF
+
+  # Set environment variables
+  cat << EOF > /etc/profile.d/set-env.sh
+export AWS_CA_BUNDLE="$AWS_CA_BUNDLE"
+export AWS_DEFAULT_REGION="$REGION"
+EOF
+
+# Enable and restart in case agent isn't running
+systemctl enable amazon-ssm-agent
+systemctl start amazon-ssm-agent
+
+# Create an array of EFS file system IDs
+%{for fs,id in efs_file_system_ids ~}
+EFS_FS_IDS+=(${id})
+%{endfor ~}
+
+# Create an array of EC2 mount directories
+%{for fs in efs_file_systems ~}
+EFS_EC2_MOUNTS+=(${fs.ec2_mount_directory})
+%{endfor ~}
+
+echo "EFS_FS_IDS=$${EFS_FS_IDS[@]}"
+echo "EFS_EC2_MOUNTS=$${EFS_EC2_MOUNTS[@]}"
+
+# Create and mount EFS directories
+for f in "$${!EFS_FS_IDS[@]}"; do
+  success=false
+  attempt_num=1
+  max_attempts=24
+  sleep=5
+  mkdir -p "$${EFS_EC2_MOUNTS[$f]}"
+  while [[ $success = false ]] && [[ $attempt_num -le $max_attempts ]]; do
+    mount -t efs -o tls "$${EFS_FS_IDS[$f]}":"${efs_mount_point}" "$${EFS_EC2_MOUNTS[$f]}"
+    if [[ $? -eq 0 ]]; then
+      success=true
+      echo "File system $${EFS_FS_IDS[$f]} has been successfully mounted"
+    else
+      echo "Attempt $attempt_num to mount file system $${EFS_FS_IDS[$f]} failed. Trying again..."
+      attempt_num=$(( attempt_num + 1 ))
+    fi
+  done
+  if [[ $success = false ]]; then
+    echo "Mounting the file system $${EFS_FS_IDS[$f]} failed after $attempt_num-- attempts"
+  fi
+
+# https://docs.aws.amazon.com/efs/latest/ug/efs-mount-helper.html#mount-fs-auto-mount-onreboot
+  echo "$${EFS_FS_IDS[$f]}":"${efs_mount_point}" "$${EFS_EC2_MOUNTS[$f]}" efs _netdev,noresvport,tls 0 0 >> /etc/fstab
+done
+
+
+EFS_BASE_DIR=$(echo "$${EFS_EC2_MOUNTS[0]}" | cut -d '/' -f 1,2) # for example, if ec2_mount_dir = /mnt/efs, EFS_BASE_DIR = /mnt
+
+chown -R ec2-user:ec2-user "$EFS_BASE_DIR"
+
+DATETIME_END=$(date -u '+%Y_%m_%d_T%H:%M:%SZ')
+echo "User data complete at $DATETIME_END"
