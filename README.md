@@ -1,4 +1,4 @@
-# How to create CloudWatch dashboards using Jinja templates
+# How to create Amazon CloudWatch dashboards using Jinja templates
 This project demonstrates how to discover create dynamic, custom CloudWatch dashboards by using Jinja templates to render the dashboard body. The example creates CloudWatch dashboards for three support tiers - resource, service, and system - to monitor performance of Amazon Elastic File System volumes. Note that the dashboards specify line colors based on a color blind safe palette.
 
 ## How it works
